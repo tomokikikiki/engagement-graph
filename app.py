@@ -22,15 +22,9 @@ if not check_password(): st.stop()
 # -------------------------------------------
 @st.cache_data
 def load_data_from_csv():
-    """
-    GitHub Actions等で生成されたCSVデータを読み込む
-    """
     file_path = "data/engagement.csv"
-    
-    # ファイルがない場合のハンドリング
     if not os.path.exists(file_path):
         return pd.DataFrame()
-    
     try:
         df = pd.read_csv(file_path)
         return df
@@ -38,7 +32,6 @@ def load_data_from_csv():
         st.error(f"Error loading CSV: {e}")
         return pd.DataFrame()
 
-# データを読み込み
 df_raw = load_data_from_csv()
 
 # -------------------------------------------
@@ -46,18 +39,15 @@ df_raw = load_data_from_csv()
 # -------------------------------------------
 st.sidebar.header("⚙️ 設定")
 
-# データがない場合の表示
 if df_raw.empty:
     st.warning("データファイル (data/engagement.csv) が見つかりません。")
-    st.info("💡 ヒント: 初回のデータ取得スクリプトが実行されるのを待つか、手動で `python scripts/update_data.py` を実行してください。")
     st.stop()
 
-# 最終更新日時の表示
+# 更新日時
 try:
     file_stat = os.stat("data/engagement.csv")
-    last_updated = pd.to_datetime(file_stat.st_mtime, unit='s')
-    last_updated_jst = last_updated + pd.Timedelta(hours=9)
-    st.sidebar.caption(f"最終更新: {last_updated_jst.strftime('%Y-%m-%d %H:%M')}")
+    last_updated = pd.to_datetime(file_stat.st_mtime, unit='s') + pd.Timedelta(hours=9)
+    st.sidebar.caption(f"最終更新: {last_updated.strftime('%Y-%m-%d %H:%M')}")
 except:
     pass
 
@@ -68,19 +58,18 @@ w_linear = st.sidebar.slider("Linear (1完了あたり)", 0.5, 5.0, 1.0, 0.1)
 # -------------------------------------------
 # 4. スコア計算
 # -------------------------------------------
-# ★ここが重要: 期間フィルタリング(Date)を行わず、CSVの値をそのまま使う
-
 df_calc = df_raw.copy()
 
-# スコア計算
+# NaN埋め（エラー防止）
+df_calc["Slack Count"] = df_calc["Slack Count"].fillna(0)
+df_calc["Linear Count"] = df_calc["Linear Count"].fillna(0)
+
 df_calc["Slack Score"] = df_calc["Slack Count"] * w_slack
 df_calc["Linear Score"] = df_calc["Linear Count"] * w_linear
 df_calc["Total Score"] = df_calc["Slack Score"] + df_calc["Linear Score"]
-
-# 生産性 (Score / Hour) ※0割り防止
 df_calc["Productivity"] = df_calc["Total Score"] / df_calc["Working Hours"].replace(0, 1)
 
-# ランキング順にソート
+# ランキング順にソート (スコア0の人も含む)
 df_ranked = df_calc.sort_values("Total Score", ascending=False).reset_index(drop=True)
 df_ranked.index += 1
 
@@ -88,7 +77,11 @@ df_ranked.index += 1
 # 5. 可視化 (Dashboard)
 # -------------------------------------------
 st.title("📊 Team Engagement Graph")
-st.markdown("直近30日間のアクティビティ集計")
+
+# ★追加: 集計ステータスの表示
+total_members = len(df_ranked)
+active_members = len(df_ranked[df_ranked["Total Score"] > 0])
+st.markdown(f"**集計対象: {total_members} 名** (うちスコア発生: {active_members} 名)")
 
 col1, col2 = st.columns([1, 1])
 
@@ -97,12 +90,11 @@ with col1:
     
     # グラフ用にデータを整形
     df_chart = df_ranked[["User", "Slack Score", "Linear Score"]].melt(
-        id_vars="User", 
-        var_name="Type", 
-        value_name="Score"
+        id_vars="User", var_name="Type", value_name="Score"
     )
     
-    # 積み上げ棒グラフ
+    # 棒グラフ (全員を表示するために高さ制限を外す等の工夫は難しいが、データは渡す)
+    # ※Streamlitの仕様上、0点のデータは棒が表示されませんが、スペースは確保されます
     st.bar_chart(
         df_chart,
         x="User",
@@ -111,41 +103,30 @@ with col1:
         stack=True
     )
     
-    st.subheader("⏱ 稼働時間 vs 成果")
-    # 散布図 (Role列がある場合のみ色分け)
-    color_col = "Role" if "Role" in df_ranked.columns else None
-    st.scatter_chart(
-        df_ranked,
-        x="Working Hours",
-        y="Total Score",
-        color=color_col,
-        size="Productivity"
-    )
+    st.info("※ 棒グラフはスコアが 0 のメンバーは表示されません。")
 
 with col2:
     st.subheader("🏆 ランキング表")
     
-    # 表示用カラムの選定 (存在しないカラムは除外)
-    cols = ["User", "Role", "Total Score", "Slack Count", "Linear Count", "Working Hours"]
-    display_cols = [c for c in cols if c in df_ranked.columns]
-    display_df = df_ranked[display_cols]
+    potential_cols = ["User", "Role", "Total Score", "Slack Count", "Linear Count"]
+    display_cols = [c for c in potential_cols if c in df_ranked.columns]
     
-    # リッチなテーブル表示
+    # ★変更点: height=800 を指定して、縦に長く表示する (スクロール減らす)
     st.dataframe(
-        display_df,
+        df_ranked[display_cols],
         use_container_width=True,
+        height=800,  # 800pxの高さ確保
         column_config={
+            "User": st.column_config.TextColumn("Name", width="medium"),
             "Total Score": st.column_config.ProgressColumn(
                 "Score",
                 format="%.1f",
                 min_value=0,
                 max_value=float(df_ranked["Total Score"].max()) * 1.1,
             ),
-            "Slack Count": st.column_config.NumberColumn("Slack投稿"),
-            "Linear Count": st.column_config.NumberColumn("Linear完了"),
         }
     )
 
 # デバッグ用
-with st.expander("📝 ソースデータ (CSV) を見る"):
+with st.expander("📝 全データのリストを確認"):
     st.dataframe(df_raw)

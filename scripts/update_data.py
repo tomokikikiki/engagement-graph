@@ -1,4 +1,5 @@
 import os
+import time
 import pandas as pd
 import requests
 from slack_sdk import WebClient
@@ -6,18 +7,15 @@ from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
 
 # ------------------------------------------------------------------
-# 1. Slackから「名簿」を作る関数 (属性情報のマスター)
+# 1. Slackから「名簿」を作る関数
 # ------------------------------------------------------------------
 def fetch_slack_user_directory():
-    """
-    Slackから全メンバーの属性情報を取得し、Emailをキーにした辞書を作る
-    """
     token = os.environ.get("SLACK_TOKEN")
     if not token:
-        raise ValueError("環境変数 'SLACK_TOKEN' が設定されていません。")
+        print("Skipping Slack directory: Token missing.")
+        return {}
 
     client = WebClient(token=token)
-    
     try:
         users_resp = client.users_list()
     except SlackApiError as e:
@@ -25,53 +23,47 @@ def fetch_slack_user_directory():
         return {}
 
     directory = {}
-    
     for u in users_resp["members"]:
-        # Bot、削除済み、プロフィール取得不可のユーザーは除外
         if u["is_bot"] or u["deleted"] or "profile" not in u:
             continue
-            
         email = u["profile"].get("email")
         if not email:
             continue
             
-        # Slackのゲストアカウント判定 (シングル/マルチチャンネルゲスト)
         is_guest = u.get("is_restricted", False) or u.get("is_ultra_restricted", False)
-        
         directory[email] = {
-            "User Name": u.get("real_name") or u["name"], # Slackの表示名を採用
-            "Role": "Contractor" if is_guest else "Employee", # ゲストなら委託、それ以外は正社員
-            "Avatar": u["profile"].get("image_48", "") # アイコン画像
+            "User Name": u.get("real_name") or u["name"],
+            "Role": "Contractor" if is_guest else "Employee",
+            "Avatar": u["profile"].get("image_48", "")
         }
-    
     return directory
 
 # ------------------------------------------------------------------
-# 2. Slackのメッセージ数を集計する関数
+# 2. Slackのメッセージ数を集計する関数 (スレッド対応版)
 # ------------------------------------------------------------------
 def fetch_slack_data(start_date, end_date):
+    print("--- Fetching Slack Data (Including Threads) ---")
     token = os.environ.get("SLACK_TOKEN")
     channel_id = os.environ.get("SLACK_CHANNEL_ID")
     
     if not token or not channel_id:
-        print("Skipping Slack data fetch: Token or Channel ID missing.")
+        print("Token or Channel ID missing.")
         return pd.DataFrame(columns=["Email", "Slack Count"])
 
     client = WebClient(token=token)
-    
-    # UNIXタイムスタンプに変換
     oldest = start_date.timestamp()
     latest = end_date.timestamp()
     
     try:
-        # ユーザーIDとEmailの対応表を作成
+        # A. ユーザーID対応表
         users_resp = client.users_list()
         uid_to_email = {}
         for u in users_resp["members"]:
             if "profile" in u and "email" in u["profile"]:
                 uid_to_email[u["id"]] = u["profile"]["email"]
 
-        # 履歴取得 (limit=1000: 必要に応じてページネーション実装)
+        # B. 親メッセージ履歴取得
+        # ※直近30日間の親メッセージを取得
         history = client.conversations_history(
             channel=channel_id, 
             oldest=oldest, 
@@ -79,13 +71,61 @@ def fetch_slack_data(start_date, end_date):
             limit=1000
         )
         
-        counts = {} # {Email: Count}
-        for msg in history["messages"]:
+        messages = history["messages"]
+        print(f"Found {len(messages)} parent messages. Analyzing threads...")
+        
+        counts = {} 
+        
+        # C. メッセージを走査
+        for i, msg in enumerate(messages):
+            # システムメッセージやBot除外
+            if "subtype" in msg or "bot_id" in msg:
+                continue
+            
+            # --- 1. 親メッセージのカウント ---
             uid = msg.get("user")
             if uid in uid_to_email:
                 email = uid_to_email[uid]
                 counts[email] = counts.get(email, 0) + 1
-                
+
+            # --- 2. スレッド（返信）のカウント ---
+            # thread_ts があり、かつ返信数が1以上の場合
+            if "thread_ts" in msg and msg.get("reply_count", 0) > 0:
+                try:
+                    replies_resp = client.conversations_replies(
+                        channel=channel_id,
+                        ts=msg["thread_ts"],
+                        limit=1000,
+                        oldest=oldest, # 期間内の返信のみ対象にする
+                        latest=latest
+                    )
+                    
+                    for reply in replies_resp["messages"]:
+                        # 親メッセージ自体の重複カウントを防ぐ
+                        if reply["ts"] == msg["ts"]:
+                            continue
+                        
+                        # Bot除外
+                        if "bot_id" in reply:
+                            continue
+                            
+                        r_uid = reply.get("user")
+                        if r_uid in uid_to_email:
+                            r_email = uid_to_email[r_uid]
+                            counts[r_email] = counts.get(r_email, 0) + 1
+                    
+                    # APIレート制限対策 (重要)
+                    time.sleep(0.1) 
+                    
+                except SlackApiError as e:
+                    print(f"Thread fetch warning: {e}")
+                    time.sleep(1) # エラー時は少し長く待つ
+                    continue
+
+            # 進捗ログ (50件ごと)
+            if (i + 1) % 50 == 0:
+                print(f"Processed {i + 1}/{len(messages)} threads...")
+
         return pd.DataFrame(list(counts.items()), columns=["Email", "Slack Count"])
 
     except SlackApiError as e:
@@ -93,7 +133,7 @@ def fetch_slack_data(start_date, end_date):
         return pd.DataFrame(columns=["Email", "Slack Count"])
 
 # ------------------------------------------------------------------
-# 3. LinearのIssue完了数を集計する関数
+# 3. Linearの集計関数
 # ------------------------------------------------------------------
 def fetch_linear_data(start_date):
     api_key = os.environ.get("LINEAR_KEY")
@@ -104,9 +144,16 @@ def fetch_linear_data(start_date):
     url = "https://api.linear.app/graphql"
     date_str = start_date.strftime("%Y-%m-%d")
     
+    # 完了かつキャンセルされていないIssueを最大100件取得
     query = f"""
     query {{
-      issues(filter: {{ completedAt: {{ gte: "{date_str}" }} }}) {{
+      issues(
+        first: 100
+        filter: {{ 
+          completedAt: {{ gte: "{date_str}" }}
+          state: {{ type: {{ eq: "completed" }} }}
+        }}
+      ) {{
         nodes {{
           title
           assignee {{
@@ -143,59 +190,49 @@ def fetch_linear_data(start_date):
         return pd.DataFrame(columns=["Email", "Linear Count"])
 
 # ------------------------------------------------------------------
-# 4. メイン実行処理 (結合とCSV保存)
+# 4. メイン実行処理
 # ------------------------------------------------------------------
 def main():
     print("🚀 Starting data update...")
     
-    # 集計期間の設定 (例: 過去30日間)
-    # 定期実行でデータを上書き更新していくスタイル
+    # 直近30日間を集計
     end_date = datetime.now()
     start_date = end_date - timedelta(days=30)
     
     print(f"📅 Range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
-    # 1. 名簿の取得 (Slack)
-    print("running: fetch_slack_user_directory...")
+    # 1. データ取得
     user_directory = fetch_slack_user_directory()
-    
-    # 2. データの取得
-    print("running: fetch_slack_data...")
     df_slack = fetch_slack_data(start_date, end_date)
-    
-    print("running: fetch_linear_data...")
     df_linear = fetch_linear_data(start_date)
     
-    # 3. メールアドレスのユニオンを作成
+    # 2. 名寄せ
     emails_slack = set(df_slack["Email"]) if not df_slack.empty else set()
     emails_linear = set(df_linear["Email"]) if not df_linear.empty else set()
     all_emails = set(user_directory.keys()) | emails_slack | emails_linear
     
-    # 4. データ結合
     rows = []
     for email in all_emails:
-        # プロフィール取得 (名簿になければUnknown)
         profile = user_directory.get(email, {
             "User Name": email, 
             "Role": "Unknown", 
             "Avatar": ""
         })
         
-        # Slackカウント取得
+        # Slack Count
         slack_count = 0
         if not df_slack.empty:
             s_row = df_slack[df_slack["Email"] == email]
             if not s_row.empty:
                 slack_count = s_row["Slack Count"].sum()
         
-        # Linearカウント取得
+        # Linear Count
         linear_count = 0
         if not df_linear.empty:
             l_row = df_linear[df_linear["Email"] == email]
             if not l_row.empty:
                 linear_count = l_row["Linear Count"].sum()
         
-        # 行データの追加
         rows.append({
             "Email": email,
             "User": profile["User Name"],
@@ -203,21 +240,16 @@ def main():
             "Avatar": profile["Avatar"],
             "Slack Count": int(slack_count),
             "Linear Count": int(linear_count),
-            # 稼働時間の仮定 (正社員:40h, 委託:20h)
             "Working Hours": 40 if profile["Role"] == "Employee" else 20
         })
     
-    # 5. CSV保存
     if not rows:
         print("⚠️ No data found.")
         return
 
     df_merged = pd.DataFrame(rows)
     
-    # 保存先ディレクトリの作成
     os.makedirs("data", exist_ok=True)
-    
-    # CSV出力
     output_path = "data/engagement.csv"
     df_merged.to_csv(output_path, index=False)
     print(f"✅ Saved to {output_path}")
