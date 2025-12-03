@@ -1,35 +1,25 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
 import os
 
-# --- セキュリティ設定: パスワード認証 ---
-def check_password():
-    """パスワードが合致した場合のみTrueを返す"""
-    # secretsにパスワードが設定されているか確認
-    if "app_password" not in st.secrets:
-        st.error("管理画面でパスワードが設定されていません。")
-        return False
-    
-    # ユーザーに入力を求める
-    password = st.text_input("🔑 アクセスパスワードを入力してください", type="password")
-    
-    if password == st.secrets["app_password"]:
-        return True
-    elif password:
-        st.warning("パスワードが間違っています。")
-    return False
-
-# 認証チェック
-if not check_password():
-    st.stop()  # パスワードが違う場合はここで処理を停止（中身を見せない）
-
 # -------------------------------------------
-# 1. ページ設定とデータ生成 (実運用ではDBから取得)
+# 1. ページ設定
 # -------------------------------------------
 st.set_page_config(page_title="Engagement Graph", layout="wide")
 
+# パスワード認証
+def check_password():
+    if "app_password" not in st.secrets: return True
+    pwd = st.text_input("🔑 Password", type="password")
+    if pwd == st.secrets["app_password"]: return True
+    if pwd: st.warning("Incorrect password")
+    return False
+
+if not check_password(): st.stop()
+
+# -------------------------------------------
+# 2. データ読み込み (CSVから)
+# -------------------------------------------
 @st.cache_data
 def load_data_from_csv():
     """
@@ -37,6 +27,7 @@ def load_data_from_csv():
     """
     file_path = "data/engagement.csv"
     
+    # ファイルがない場合のハンドリング
     if not os.path.exists(file_path):
         return pd.DataFrame()
     
@@ -51,118 +42,110 @@ def load_data_from_csv():
 df_raw = load_data_from_csv()
 
 # -------------------------------------------
-# 2. サイドバー (設定・フィルタ)
+# 3. サイドバー設定
 # -------------------------------------------
-st.sidebar.header("⚙️ 設定 & フィルタ")
+st.sidebar.header("⚙️ 設定")
 
-# A. 期間選択 (デフォルトは直近1週間)
-st.sidebar.subheader("📅 集計期間")
-today = datetime.today()
-last_week = today - timedelta(days=7)
-
-date_range = st.sidebar.date_input(
-    "期間を選んでください",
-    value=(last_week, today), # デフォルト値
-    max_value=today
-)
-
-# 期間フィルタリング処理
-if len(date_range) == 2:
-    start_date, end_date = date_range
-    # DataFrameを期間で絞り込み
-    start_date = pd.to_datetime(start_date)
-    end_date = pd.to_datetime(end_date)
-    df_filtered = df_raw[(df_raw["Date"] >= start_date) & (df_raw["Date"] <= end_date)]
-else:
-    st.error("開始日と終了日を選択してください")
+# データがない場合の表示
+if df_raw.empty:
+    st.warning("データファイル (data/engagement.csv) が見つかりません。")
+    st.info("💡 ヒント: 初回のデータ取得スクリプトが実行されるのを待つか、手動で `python scripts/update_data.py` を実行してください。")
     st.stop()
 
-# B. ウェイト調整 (シミュレーション用)
+# 最終更新日時の表示
+try:
+    file_stat = os.stat("data/engagement.csv")
+    last_updated = pd.to_datetime(file_stat.st_mtime, unit='s')
+    last_updated_jst = last_updated + pd.Timedelta(hours=9)
+    st.sidebar.caption(f"最終更新: {last_updated_jst.strftime('%Y-%m-%d %H:%M')}")
+except:
+    pass
+
 st.sidebar.subheader("⚖️ スコアの重み付け")
 w_slack = st.sidebar.slider("Slack (1投稿あたり)", 0.0, 0.5, 0.1, 0.01)
 w_linear = st.sidebar.slider("Linear (1完了あたり)", 0.5, 5.0, 1.0, 0.1)
 
 # -------------------------------------------
-# 3. データ集計ロジック
+# 4. スコア計算
 # -------------------------------------------
-# ユーザーごとに合計を算出
-df_grouped = df_filtered.groupby("User")[["Slack Count", "Linear Count", "Working Hours"]].sum().reset_index()
+# ★ここが重要: 期間フィルタリング(Date)を行わず、CSVの値をそのまま使う
+
+df_calc = df_raw.copy()
 
 # スコア計算
-df_grouped["Slack Score"] = df_grouped["Slack Count"] * w_slack
-df_grouped["Linear Score"] = df_grouped["Linear Count"] * w_linear
-df_grouped["Total Score"] = df_grouped["Slack Score"] + df_grouped["Linear Score"]
+df_calc["Slack Score"] = df_calc["Slack Count"] * w_slack
+df_calc["Linear Score"] = df_calc["Linear Count"] * w_linear
+df_calc["Total Score"] = df_calc["Slack Score"] + df_calc["Linear Score"]
 
 # 生産性 (Score / Hour) ※0割り防止
-df_grouped["Productivity"] = df_grouped["Total Score"] / df_grouped["Working Hours"].replace(0, 1)
+df_calc["Productivity"] = df_calc["Total Score"] / df_calc["Working Hours"].replace(0, 1)
 
 # ランキング順にソート
-df_ranked = df_grouped.sort_values("Total Score", ascending=False).reset_index(drop=True)
-df_ranked.index += 1 # 1位から始める
+df_ranked = df_calc.sort_values("Total Score", ascending=False).reset_index(drop=True)
+df_ranked.index += 1
 
 # -------------------------------------------
-# 4. メインコンテンツ表示
+# 5. 可視化 (Dashboard)
 # -------------------------------------------
 st.title("📊 Team Engagement Graph")
-st.markdown(f"集計期間: **{start_date.strftime('%Y-%m-%d')}** 〜 **{end_date.strftime('%Y-%m-%d')}**")
+st.markdown("直近30日間のアクティビティ集計")
 
-# カラム分け (左: グラフ, 右: ランキング)
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("📈 Engagement 内訳 (積上げ)")
-    # グラフ用にデータを整形 (Melt)
+    st.subheader("📈 Engagement 内訳")
+    
+    # グラフ用にデータを整形
     df_chart = df_ranked[["User", "Slack Score", "Linear Score"]].melt(
         id_vars="User", 
         var_name="Type", 
         value_name="Score"
     )
     
-    # 棒グラフ表示 (SlackとLinearの色分け)
+    # 積み上げ棒グラフ
     st.bar_chart(
         df_chart,
         x="User",
         y="Score",
         color="Type",
-        stack=True  # 積み上げグラフにする
+        stack=True
     )
-
-    st.subheader("⏱ 稼働時間 vs 成果 (散布図)")
+    
+    st.subheader("⏱ 稼働時間 vs 成果")
+    # 散布図 (Role列がある場合のみ色分け)
+    color_col = "Role" if "Role" in df_ranked.columns else None
     st.scatter_chart(
         df_ranked,
         x="Working Hours",
         y="Total Score",
-        color="User",
-        size="Productivity" # 円の大きさで生産性を表現
+        color=color_col,
+        size="Productivity"
     )
 
 with col2:
     st.subheader("🏆 ランキング表")
     
-    # 表示するカラムを整理
-    display_df = df_ranked[[
-        "User", "Total Score", "Slack Count", "Linear Count", "Working Hours"
-    ]]
+    # 表示用カラムの選定 (存在しないカラムは除外)
+    cols = ["User", "Role", "Total Score", "Slack Count", "Linear Count", "Working Hours"]
+    display_cols = [c for c in cols if c in df_ranked.columns]
+    display_df = df_ranked[display_cols]
     
-    # リッチなテーブル表示 (進捗バーなどを付与)
+    # リッチなテーブル表示
     st.dataframe(
         display_df,
         use_container_width=True,
         column_config={
             "Total Score": st.column_config.ProgressColumn(
-                "Engagement Score",
-                help="SlackとLinearの加重平均スコア",
+                "Score",
                 format="%.1f",
                 min_value=0,
-                max_value=float(df_ranked["Total Score"].max()) * 1.1, # 最大値を少し余裕持たせる
+                max_value=float(df_ranked["Total Score"].max()) * 1.1,
             ),
-            "Slack Count": st.column_config.NumberColumn("Slack投稿数"),
-            "Linear Count": st.column_config.NumberColumn("Issue完了数"),
+            "Slack Count": st.column_config.NumberColumn("Slack投稿"),
+            "Linear Count": st.column_config.NumberColumn("Linear完了"),
         }
     )
 
-# -------------------------------------------
-# 5. 生データ確認用 (アコーディオン)
-# -------------------------------------------
-with st.expander("📝 集計前の生データを見る"):
-    st.dataframe(df_filtered)
+# デバッグ用
+with st.expander("📝 ソースデータ (CSV) を見る"):
+    st.dataframe(df_raw)
