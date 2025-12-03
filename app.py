@@ -30,42 +30,24 @@ if not check_password():
 st.set_page_config(page_title="Engagement Graph", layout="wide")
 
 @st.cache_data
-def load_dummy_data():
+def load_data_from_csv():
     """
-    開発用にダミーデータを生成する関数
-    実運用ではここでGoogle SheetsやBigQueryからデータを取得します
+    GitHub Actions等で生成されたCSVデータを読み込む
     """
-    # 過去30日分のデータを生成
-    dates = pd.date_range(end=datetime.today(), periods=30).tolist()
-    users = [
-        {"name": "Tanaka (正社員)", "role": "Employee"},
-        {"name": "Suzuki (正社員)", "role": "Employee"},
-        {"name": "Sato (業務委託)", "role": "Contractor"},
-        {"name": "Yamada (業務委託)", "role": "Contractor"},
-        {"name": "Kato (正社員)", "role": "Employee"},
-    ]
+    file_path = "data/engagement.csv"
     
-    data = []
-    for date in dates:
-        for user in users:
-            # ランダムに活動量を生成
-            slack = np.random.randint(0, 30)  # 0~30 messages
-            linear = np.random.randint(0, 5)  # 0~5 issues
-            hours = 8 if user["role"] == "Employee" else np.random.randint(4, 10)
-            
-            data.append({
-                "Date": date,
-                "User": user["name"],
-                "Role": user["role"],
-                "Slack Count": slack,
-                "Linear Count": linear,
-                "Working Hours": hours
-            })
+    if not os.path.exists(file_path):
+        return pd.DataFrame()
     
-    return pd.DataFrame(data)
+    try:
+        df = pd.read_csv(file_path)
+        return df
+    except Exception as e:
+        st.error(f"Error loading CSV: {e}")
+        return pd.DataFrame()
 
 # データを読み込み
-df_raw = load_dummy_data()
+df_raw = load_data_from_csv()
 
 # -------------------------------------------
 # 2. サイドバー (設定・フィルタ)
