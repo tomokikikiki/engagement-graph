@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import os
 
 # --- セキュリティ設定: パスワード認証 ---
 def check_password():
